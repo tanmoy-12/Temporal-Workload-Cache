@@ -29,6 +29,15 @@ DATASETS = {
     },
 }
 
+# Optional: read the raw files from a local folder instead of HDFS, e.g.
+#   export LOCAL_DATA_DIR=/home/tanmoy
+# Weekly counts are identical either way; only the source of the raw file changes.
+LOCAL_DATA_DIR = os.environ.get("LOCAL_DATA_DIR")
+
+# Weekly counts are saved here after the first load, so later runs skip
+# reading and aggregating the raw data entirely.
+WEEKLY_CACHE_DIR = os.environ.get("WEEKLY_CACHE_DIR", "./weekly_cache")
+
 SECONDS_PER_WEEK = 7 * 24 * 60 * 60
 DEFAULT_Z_THRESHOLD = 1.0
 DEFAULT_VIRTUAL_RATIO = 0.30
@@ -81,10 +90,24 @@ def load_weekly_activity(spark: SparkSession, dataset_key: str):
     cfg = DATASETS[dataset_key]
     dataset_name = cfg["name"]
     input_path = cfg["path"]
+    if LOCAL_DATA_DIR:
+        input_path = "file://" + os.path.join(
+            os.path.abspath(LOCAL_DATA_DIR), os.path.basename(input_path)
+        )
+
+    cache_csv = os.path.join(WEEKLY_CACHE_DIR, f"{dataset_key}_weekly.csv")
+    meta_csv = os.path.join(WEEKLY_CACHE_DIR, f"{dataset_key}_meta.csv")
+    if os.path.exists(cache_csv) and os.path.exists(meta_csv):
+        weekly_pd = pd.read_csv(cache_csv)
+        metadata = pd.read_csv(meta_csv).iloc[0].to_dict()
+        metadata["total_records"] = int(metadata["total_records"])
+        metadata["observed_weekly_windows"] = int(metadata["observed_weekly_windows"])
+        print(f"\nLoaded cached weekly counts for {dataset_name}: {cache_csv}")
+        return weekly_pd, metadata
 
     print("\n" + "=" * 78)
     print(f"Loading: {dataset_name}")
-    print(f"HDFS:    {input_path}")
+    print(f"Source:  {input_path}")
     print("=" * 78)
 
     raw_df = spark.read.json(input_path)
@@ -128,6 +151,11 @@ def load_weekly_activity(spark: SparkSession, dataset_key: str):
 
     del raw_df, ts_df, weekly_df
     gc.collect()
+
+    os.makedirs(WEEKLY_CACHE_DIR, exist_ok=True)
+    weekly_pd.to_csv(cache_csv, index=False)
+    pd.DataFrame([metadata]).to_csv(meta_csv, index=False)
+    print(f"Saved weekly counts to:  {cache_csv}")
 
     return weekly_pd, metadata
 

@@ -42,6 +42,8 @@ def parse_args():
     p.add_argument("--runs", type=int, default=DEFAULT_MEASURED_RUNS)
     p.add_argument("--driver-memory", default="4g")
     p.add_argument("--output-dir", default="./all_match_results/baselines")
+    p.add_argument("--skip-spark-cache", action="store_true",
+                   help="Reuse previously reported Spark-cache timings instead of rerunning.")
     return p.parse_args()
 
 
@@ -55,6 +57,7 @@ def mean_sd(values):
 
 def summarize_runs(method, rows, test_count):
     df = pd.DataFrame(rows)
+    matched = int(df["matched_queries"].iloc[0]) if "matched_queries" in df else None
     tm, ts = mean_sd(df["total_query_time_sec"])
     lm, ls = mean_sd(df["avg_lookup_latency_sec"])
     qm, qs = mean_sd(df["throughput_qps"])
@@ -67,6 +70,8 @@ def summarize_runs(method, rows, test_count):
         "throughput_mean_qps": qm,
         "throughput_std_qps": qs,
         "test_windows": int(test_count),
+        "matched_queries": matched,
+        "match_rate": (matched / test_count) if matched is not None else None,
     }, df
 
 
@@ -80,6 +85,7 @@ def build_temporal_blocks(train_data, num_partitions):
 
 def run_temporal_once(test_data, temporal_blocks):
     times = []
+    n_matched = 0
     for _, row in test_data.iterrows():
         target = row["activity_count"]
         start = time.perf_counter()
@@ -92,11 +98,13 @@ def run_temporal_once(test_data, temporal_blocks):
                 break
         end = time.perf_counter()
         times.append(end - start)
+        n_matched += int(matched)
     total = sum(times)
     return {
         "total_query_time_sec": total,
         "avg_lookup_latency_sec": statistics.mean(times),
         "throughput_qps": len(test_data) / total,
+        "matched_queries": n_matched,
     }
 
 
@@ -110,6 +118,7 @@ def build_hash_blocks(train_data, num_partitions):
 
 def run_hash_once(test_data, hash_blocks, num_partitions):
     times = []
+    n_matched = 0
     for _, row in test_data.iterrows():
         week = int(row["week_number"])
         target = int(row["activity_count"])
@@ -118,28 +127,33 @@ def run_hash_once(test_data, hash_blocks, num_partitions):
         _matched = target in hash_blocks[block_idx]
         end = time.perf_counter()
         times.append(end - start)
+        n_matched += int(_matched)
     total = sum(times)
     return {
         "total_query_time_sec": total,
         "avg_lookup_latency_sec": statistics.mean(times),
         "throughput_qps": len(test_data) / total,
+        "matched_queries": n_matched,
     }
 
 
 def run_spark_cache_once(test_data, cached_spark_df):
     times = []
+    n_matched = 0
     for _, row in test_data.iterrows():
         target = int(row["activity_count"])
         start = time.perf_counter()
         # Preserve the original exact-equality Spark-cache baseline semantics.
-        cached_spark_df.filter(F.col("activity_count") == target).count()
+        hits = cached_spark_df.filter(F.col("activity_count") == target).count()
         end = time.perf_counter()
         times.append(end - start)
+        n_matched += int(hits > 0)
     total = sum(times)
     return {
         "total_query_time_sec": total,
         "avg_lookup_latency_sec": statistics.mean(times),
         "throughput_qps": len(test_data) / total,
+        "matched_queries": n_matched,
     }
 
 
@@ -195,20 +209,27 @@ def main():
             runs.to_csv(os.path.join(dataset_dir, "hash_runs.csv"), index=False)
 
             # 3) Native Spark cache - original exact-match semantics.
-            spark_train = spark.createDataFrame(
-                train[["week_number", "activity_count"]]
-            ).cache()
-            spark_train.count()  # materialize cache before timing
+            if args.skip_spark_cache:
+                train_set = set(train["activity_count"].astype(int))
+                m = sum(int(v) in train_set for v in test["activity_count"])
+                dataset_summaries.append({"method": "Native Spark Cache (match count only)",
+                    "test_windows": len(test), "matched_queries": m,
+                    "match_rate": m / len(test)})
+            else:
+                spark_train = spark.createDataFrame(
+                    train[["week_number", "activity_count"]]
+                ).cache()
+                spark_train.count()  # materialize cache before timing
 
-            spark_rows = repeated_simple(
-                lambda: run_spark_cache_once(test, spark_train),
-                args.warmups,
-                args.runs,
-            )
-            summary, runs = summarize_runs("Native Spark Cache", spark_rows, len(test))
-            dataset_summaries.append(summary)
-            runs.to_csv(os.path.join(dataset_dir, "spark_cache_runs.csv"), index=False)
-            spark_train.unpersist()
+                spark_rows = repeated_simple(
+                    lambda: run_spark_cache_once(test, spark_train),
+                    args.warmups,
+                    args.runs,
+                )
+                summary, runs = summarize_runs("Native Spark Cache", spark_rows, len(test))
+                dataset_summaries.append(summary)
+                runs.to_csv(os.path.join(dataset_dir, "spark_cache_runs.csv"), index=False)
+                spark_train.unpersist()
 
             # 4) Proposed method with ALL-MATCH training.
             initial_blocks, overlap = build_blocks_all_match(
@@ -240,6 +261,8 @@ def main():
                 "virtual_hit_ratio": proposed_summary["virtual_hit_ratio"],
                 "main_hit_ratio": proposed_summary["main_hit_ratio"],
                 "miss_ratio": proposed_summary["miss_ratio"],
+                "matched_queries": len(test) - proposed_summary["miss_count"],
+                "match_rate": 1 - proposed_summary["miss_ratio"],
                 **overlap,
             }
             dataset_summaries.append(summary)
@@ -275,6 +298,7 @@ def main():
                         "total_time_mean_sec",
                         "avg_latency_mean_sec",
                         "throughput_mean_qps",
+                        "match_rate",
                     ]
                 ].to_string(index=False)
             )
